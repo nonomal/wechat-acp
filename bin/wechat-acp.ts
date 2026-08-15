@@ -10,6 +10,7 @@
  *   wechat-acp --agent "claude code" --daemon
  *   wechat-acp stop
  *   wechat-acp status
+ *   wechat-acp inject --text "今日 AI 资讯"
  */
 
 import fs from "node:fs";
@@ -19,10 +20,17 @@ import qrcodeTerminal from "qrcode-terminal";
 import { WeChatAcpBridge } from "../src/bridge.js";
 import {
   defaultConfig,
+  defaultStorageDir,
   listBuiltInAgents,
+  parseResourceInlineLimit,
+  parseSessionResumePolicy,
   resolveAgentSelection,
+  validateCommandAliases,
+  validateInstanceName,
 } from "../src/config.js";
 import type { WeChatAcpConfig } from "../src/config.js";
+import { queueInjectedMessage } from "../src/inject/queue.js";
+import { DEFAULT_INJECTION_TARGET } from "../src/inject/types.js";
 import {
   initTelemetry,
   trackEvent,
@@ -37,11 +45,12 @@ function usage(): void {
     .join(", ");
 
   console.log(`
-wechat-acp — Bridge WeChat to any ACP-compatible AI agent
+wechat-acp v${packageJson.version} — Bridge WeChat to any ACP-compatible AI agent
 
 Usage:
   wechat-acp --agent <preset|command>  [options]
   wechat-acp agents                        List built-in agent presets
+  wechat-acp inject --text <text>          Inject a local message into the daemon
   wechat-acp stop                          Stop a running daemon
   wechat-acp status                        Check daemon status
 
@@ -53,13 +62,73 @@ Options:
   --login             Force re-login (new QR code)
   --daemon            Run in background after login
   --config <file>     Config file path (JSON)
+  --instance <name>   Run as a named, isolated instance.
+                      Storage, token, daemon pid/log, and telemetry id are
+                      scoped to ~/.wechat-acp/instances/<name>/.
+                      Lets you run multiple bridges side by side, each with
+                      its own WeChat account and project cwd.
+  --inbox-dir <path>  Directory to save binary files received from WeChat
+                      (default: <storage.dir>/inbox). The agent sees the
+                      saved absolute path in the prompt so it can read the
+                      file directly.
+  --no-inbox          Disable saving received files. The agent will only
+                      see a "[Received file: name, N bytes]" notice and
+                      will not be able to read the file content.
   --idle-timeout <m>  Session idle timeout in minutes (default: 1440)
                       Use 0 to disable idle cleanup
   --max-sessions <n>  Max concurrent user sessions (default: 10)
+  --session-resume <mode>
+                      Resume ACP sessions after restart: off, auto, or required
+                      (default: off)
+  --turn-end-message <text>
+                      Send a standalone message after each completed agent turn
   --hide-thoughts     Do not forward agent thinking to WeChat (default: forwarded)
+  --show-diffs        Forward ACP file diffs to WeChat (default: hidden)
+  --hide-images       Do not forward intermediate inline tool images to WeChat
+  --hide-audio        Do not forward agent audio output to WeChat (default: forwarded)
+  --hide-resources    Do not forward intermediate tool resources
+  --resource-inline-limit <chars>
+                       Attach longer text resources as files (default: 1000)
+                       Valid range: 0-4000; 0 attaches every non-empty text resource
+  --text <text>       Message text for "inject"
+  --file <path>       Read injected message text from a file
+  --to <target>       Injection target (default: ${DEFAULT_INJECTION_TARGET})
+  --context-token <t> Override stored context token for "inject"
   -v, --verbose       Verbose logging
+  -V, --version       Print version and exit
   -h, --help          Show this help
 `);
+}
+
+async function handleInject(
+  config: WeChatAcpConfig,
+  args: ReturnType<typeof parseArgs>,
+): Promise<void> {
+  if (!config.storage.injectDir) {
+    throw new Error("storage.injectDir is not configured");
+  }
+  if (!args.injectText && !args.injectFile) {
+    throw new Error('inject requires --text <text> or --file <path>');
+  }
+  if (args.injectText && args.injectFile) {
+    throw new Error("inject accepts only one of --text or --file");
+  }
+
+  const text = args.injectFile
+    ? fs.readFileSync(path.resolve(args.injectFile), "utf-8")
+    : args.injectText!;
+
+  const { job, filePath } = await queueInjectedMessage({
+    injectDir: config.storage.injectDir,
+    text,
+    target: args.injectTo,
+    contextToken: args.injectContextToken,
+  });
+
+  console.log(`Queued injection ${job.id}`);
+  console.log(`Target: ${job.target}`);
+  console.log(`File: ${filePath}`);
+  console.log("It will be processed by any running wechat-acp instance using the same storage directory.");
 }
 
 function parseArgs(argv: string[]): {
@@ -69,17 +138,38 @@ function parseArgs(argv: string[]): {
   forceLogin: boolean;
   daemon: boolean;
   configFile?: string;
+  instance?: string;
+  inboxDir?: string;
+  disableInbox: boolean;
   idleTimeout?: number;
   maxSessions?: number;
+  sessionResume?: string;
+  turnEndMessage?: string;
+  injectText?: string;
+  injectFile?: string;
+  injectTo?: string;
+  injectContextToken?: string;
   hideThoughts: boolean;
+  showDiffs: boolean;
+  hideImages: boolean;
+  hideAudio: boolean;
+  hideResources: boolean;
+  resourceInlineLimit?: number;
   verbose: boolean;
+  version: boolean;
   help: boolean;
 } {
   const result = {
     forceLogin: false,
     daemon: false,
+    disableInbox: false,
     hideThoughts: false,
+    showDiffs: false,
+    hideImages: false,
+    hideAudio: false,
+    hideResources: false,
     verbose: false,
+    version: false,
     help: false,
   } as ReturnType<typeof parseArgs>;
 
@@ -110,18 +200,64 @@ function parseArgs(argv: string[]): {
       case "--config":
         result.configFile = args[++i];
         break;
+      case "--instance":
+        result.instance = args[++i];
+        break;
+      case "--inbox-dir":
+        result.inboxDir = args[++i];
+        break;
+      case "--no-inbox":
+        result.disableInbox = true;
+        break;
       case "--idle-timeout":
         result.idleTimeout = parseInt(args[++i], 10);
         break;
       case "--max-sessions":
         result.maxSessions = parseInt(args[++i], 10);
         break;
+      case "--session-resume":
+        result.sessionResume = args[++i];
+        break;
+      case "--turn-end-message":
+        result.turnEndMessage = args[++i];
+        break;
+      case "--text":
+        result.injectText = args[++i];
+        break;
+      case "--file":
+        result.injectFile = args[++i];
+        break;
+      case "--to":
+        result.injectTo = args[++i];
+        break;
+      case "--context-token":
+        result.injectContextToken = args[++i];
+        break;
       case "--hide-thoughts":
         result.hideThoughts = true;
+        break;
+      case "--show-diffs":
+        result.showDiffs = true;
+        break;
+      case "--hide-images":
+        result.hideImages = true;
+        break;
+      case "--hide-audio":
+        result.hideAudio = true;
+        break;
+      case "--hide-resources":
+        result.hideResources = true;
+        break;
+      case "--resource-inline-limit":
+        result.resourceInlineLimit = Number(args[++i]);
         break;
       case "-v":
       case "--verbose":
         result.verbose = true;
+        break;
+      case "-V":
+      case "--version":
+        result.version = true;
         break;
       case "-h":
       case "--help":
@@ -230,14 +366,31 @@ function renderQrInTerminal(url: string): void {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
 
+  if (args.version) {
+    console.log(packageJson.version);
+    process.exit(0);
+  }
+
   if (args.help) {
     usage();
     process.exit(0);
   }
 
-  const config = defaultConfig();
+  if (args.instance !== undefined) {
+    try {
+      validateInstanceName(args.instance);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  const config = defaultConfig({ instance: args.instance });
 
   // Load config file if specified
+  let configFileSetInboxDir = false;
+  let configFileSetStateFile = false;
+  let configFileSetInjectDir = false;
   if (args.configFile) {
     const fileConfig = loadConfigFile(args.configFile);
     Object.assign(config.wechat, fileConfig.wechat ?? {});
@@ -245,12 +398,97 @@ async function main(): Promise<void> {
     Object.assign(config.agents, fileConfig.agents ?? {});
     Object.assign(config.session, fileConfig.session ?? {});
     Object.assign(config.daemon, fileConfig.daemon ?? {});
+    if (Object.prototype.hasOwnProperty.call(fileConfig, "commandAliases")) {
+      // Assign the raw value (even if malformed) so the post-merge
+      // validateCommandAliases() below can reject it with a clean error.
+      config.commandAliases = fileConfig.commandAliases;
+    }
+    // Track whether the user explicitly set inboxDir so we don't
+    // overwrite their choice with a re-derived default below. We check
+    // before Object.assign because checking after can't distinguish
+    // "user wrote inboxDir: null to disable" from "user didn't write it".
+    if (
+      fileConfig.storage &&
+      Object.prototype.hasOwnProperty.call(fileConfig.storage, "inboxDir")
+    ) {
+      configFileSetInboxDir = true;
+    }
+    if (
+      fileConfig.storage &&
+      Object.prototype.hasOwnProperty.call(fileConfig.storage, "stateFile")
+    ) {
+      configFileSetStateFile = true;
+    }
+    if (
+      fileConfig.storage &&
+      Object.prototype.hasOwnProperty.call(fileConfig.storage, "injectDir")
+    ) {
+      configFileSetInjectDir = true;
+    }
     Object.assign(config.storage, fileConfig.storage ?? {});
+  }
+
+  // CLI --instance always wins over config-file storage.dir so users can
+  // run a config in multiple isolated instances without editing the file.
+  if (args.instance) {
+    config.storage.instance = args.instance;
+    config.storage.dir = defaultStorageDir(args.instance);
+    config.daemon.logFile = path.join(config.storage.dir, "wechat-acp.log");
+    config.daemon.pidFile = path.join(config.storage.dir, "daemon.pid");
+  }
+
+  // Resolve the final inbox directory. Precedence (highest first):
+  //   1. --no-inbox            (explicit disable)
+  //   2. --inbox-dir <path>    (explicit CLI override)
+  //   3. config.storage.inboxDir explicitly set in the config file
+  //      (relative paths are resolved against cwd)
+  //   4. Default: <storage.dir>/inbox, re-derived from whatever the
+  //      final storage.dir is. This is what keeps a config file that
+  //      only sets storage.dir consistent with the documented
+  //      "default: <storage.dir>/inbox", and also covers the
+  //      --instance case for free.
+  if (args.disableInbox) {
+    config.storage.inboxDir = null;
+  } else if (args.inboxDir) {
+    config.storage.inboxDir = path.resolve(args.inboxDir);
+  } else if (configFileSetInboxDir) {
+    if (config.storage.inboxDir && !path.isAbsolute(config.storage.inboxDir)) {
+      config.storage.inboxDir = path.resolve(config.storage.inboxDir);
+    }
+  } else {
+    config.storage.inboxDir = path.join(config.storage.dir, "inbox");
+  }
+
+  if (configFileSetStateFile) {
+    if (config.storage.stateFile && !path.isAbsolute(config.storage.stateFile)) {
+      config.storage.stateFile = path.resolve(config.storage.stateFile);
+    }
+  } else {
+    config.storage.stateFile = path.join(config.storage.dir, "state.json");
+  }
+
+  if (configFileSetInjectDir) {
+    if (config.storage.injectDir && !path.isAbsolute(config.storage.injectDir)) {
+      config.storage.injectDir = path.resolve(config.storage.injectDir);
+    }
+  } else {
+    config.storage.injectDir = path.join(config.storage.dir, "inject");
+  }
+
+  try {
+    validateCommandAliases(config.commandAliases);
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
   }
 
   // Handle subcommands
   if (args.command === "agents") {
     handleAgents(config);
+    return;
+  }
+  if (args.command === "inject") {
+    await handleInject(config, args);
     return;
   }
   if (args.command === "stop") {
@@ -281,7 +519,7 @@ async function main(): Promise<void> {
     }
   }
 
-  if (args.cwd) config.agent.cwd = path.resolve(args.cwd);
+  config.agent.cwd = path.resolve(args.cwd ?? config.agent.cwd);
   if (args.idleTimeout !== undefined) {
     if (!Number.isFinite(args.idleTimeout) || args.idleTimeout < 0) {
       console.error("Error: invalid --idle-timeout value");
@@ -291,7 +529,30 @@ async function main(): Promise<void> {
     config.session.idleTimeoutMs = args.idleTimeout * 60_000;
   }
   if (args.maxSessions) config.session.maxConcurrentUsers = args.maxSessions;
+  try {
+    config.session.resume = parseSessionResumePolicy(
+      args.sessionResume ?? config.session.resume,
+    );
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  if (args.turnEndMessage !== undefined) {
+    config.session.turnEndMessage = args.turnEndMessage;
+  }
   if (args.hideThoughts) config.agent.showThoughts = false;
+  if (args.showDiffs) config.agent.showDiffs = true;
+  if (args.hideImages) config.agent.showImages = false;
+  if (args.hideAudio) config.agent.showAudio = false;
+  if (args.hideResources) config.agent.showResources = false;
+  try {
+    config.agent.resourceInlineLimit = parseResourceInlineLimit(
+      args.resourceInlineLimit ?? config.agent.resourceInlineLimit,
+    );
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
   config.daemon.enabled = args.daemon;
 
   // Handle daemon mode
